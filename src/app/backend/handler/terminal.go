@@ -42,7 +42,7 @@ import (
 
 const (
 	defaultImage  = "pingcap/tidb-debug:latest"
-	launcherImage = "pingcap/debug-launcher:latest"
+	launcherImage = "knightxun/debug-launcher:latest"
 	launcherName  = "debug-launcher"
 	DockerSocket = "/var/run/docker.sock"
 )
