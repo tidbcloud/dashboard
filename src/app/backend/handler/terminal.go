@@ -15,13 +15,18 @@
 package handler
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"io"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 
 	restful "github.com/emicklei/go-restful/v3"
@@ -31,6 +36,14 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/klog"
+)
+
+const (
+	defaultImage  = "pingcap/tidb-debug:latest"
+	launcherImage = "pingcap/debug-launcher:latest"
+	launcherName  = "debug-launcher"
+	DockerSocket = "/var/run/docker.sock"
 )
 
 const END_OF_TRANSMISSION = "\u0004"
@@ -45,6 +58,8 @@ type PtyHandler interface {
 // TerminalSession implements PtyHandler (using a SockJS connection)
 type TerminalSession struct {
 	id            string
+	PodName       string
+	Namespace     string
 	bound         chan error
 	sockJSSession sockjs.Session
 	sizeChan      chan remotecommand.TerminalSize
@@ -90,6 +105,7 @@ func (t TerminalSession) Read(p []byte) (int, error) {
 		return copy(p, END_OF_TRANSMISSION), err
 	}
 
+	klog.Info("")
 	switch msg.Op {
 	case "stdin":
 		return copy(p, msg.Data), nil
@@ -158,9 +174,17 @@ func (sm *SessionMap) Set(sessionId string, session TerminalSession) {
 // Close shuts down the SockJS connection and sends the status code and reason to the client
 // Can happen if the process exits or if there is an error starting up the process
 // For now the status code is unused and reason is shown to the user (unless "")
-func (sm *SessionMap) Close(sessionId string, status uint32, reason string) {
+func (sm *SessionMap) Close(k8sClient kubernetes.Interface, sessionId string, status uint32, reason string) {
 	sm.Lock.Lock()
 	defer sm.Lock.Unlock()
+
+	podName := sm.Sessions[sessionId].PodName
+	namespace := sm.Sessions[sessionId].Namespace
+
+	k8sClient.CoreV1().
+		Pods(namespace).
+		Delete(context.Background(), podName, metav1.DeleteOptions{})
+
 	err := sm.Sessions[sessionId].sockJSSession.Close(status, reason)
 	if err != nil {
 		log.Println(err)
@@ -212,14 +236,40 @@ func CreateAttachHandler(path string) http.Handler {
 
 // startProcess is called by handleAttach
 // Executed cmd in the container specified in request and connects it up with the ptyHandler (a session)
-func startProcess(k8sClient kubernetes.Interface, cfg *rest.Config, request *restful.Request, cmd []string, ptyHandler PtyHandler) error {
+func startProcess(k8sClient kubernetes.Interface, cfg *rest.Config, request *restful.Request, cmd []string, sessionId string) error {
+	ptyHandler := terminalSessions.Get(sessionId)
 	namespace := request.PathParameter("namespace")
 	podName := request.PathParameter("pod")
 	containerName := request.PathParameter("container")
+	debugPodName := fmt.Sprintf("%s-%s-%s-%s", namespace, podName, containerName, launcherName)
+
+	ptyHandler.PodName = debugPodName
+	ptyHandler.Namespace = namespace
+
+	terminalSessions.Set(sessionId, ptyHandler)
+
+	_, err := k8sClient.CoreV1().Pods(namespace).Get(context.Background(), debugPodName, metav1.GetOptions{})
+
+	if errors.IsNotFound(err) {
+		execOptions := PodExecOptions{
+			Image:            defaultImage,
+			HostDockerSocket: DockerSocket,
+			LauncherImage:    launcherImage,
+			PodName: 					podName,
+			Namespace:        namespace,
+			ContainerName:    containerName,
+			Command:          []string{"bash", "-l"},
+			IOStreams: genericclioptions.IOStreams{In: os.Stdin, Out: os.Stdout, ErrOut: os.Stderr},
+		}
+		err := execOptions.Run()
+		if err != nil {
+			return err
+		}
+	}
 
 	req := k8sClient.CoreV1().RESTClient().Post().
 		Resource("pods").
-		Name(podName).
+		Name(debugPodName).
 		Namespace(namespace).
 		SubResource("exec")
 
@@ -289,23 +339,156 @@ func WaitForTerminal(k8sClient kubernetes.Interface, cfg *rest.Config, request *
 
 		if isValidShell(validShells, shell) {
 			cmd := []string{shell}
-			err = startProcess(k8sClient, cfg, request, cmd, terminalSessions.Get(sessionId))
+			err = startProcess(k8sClient, cfg, request, cmd, sessionId)
 		} else {
 			// No shell given or it was not valid: try some shells until one succeeds or all fail
 			// FIXME: if the first shell fails then the first keyboard event is lost
 			for _, testShell := range validShells {
 				cmd := []string{testShell}
-				if err = startProcess(k8sClient, cfg, request, cmd, terminalSessions.Get(sessionId)); err == nil {
+				if err = startProcess(k8sClient, cfg, request, cmd, sessionId); err == nil {
 					break
 				}
 			}
 		}
 
 		if err != nil {
-			terminalSessions.Close(sessionId, 2, err.Error())
+			terminalSessions.Close(k8sClient, sessionId, 2, err.Error())
 			return
 		}
 
-		terminalSessions.Close(sessionId, 1, "Process exited")
+		terminalSessions.Close(k8sClient, sessionId, 1, "Process exited")
 	}
+}
+
+type PodExecOptions struct {
+	Namespace string
+	PodName   string
+
+	// Debug options
+	Image            string
+	ContainerName    string
+	Command          []string
+	HostDockerSocket string
+	LauncherImage    string
+
+	KubeCli *kubernetes.Clientset
+
+	RestConfig *rest.Config
+
+	genericclioptions.IOStreams
+}
+
+func (o *PodExecOptions) Run() error {
+
+	// 0.Prepare debug context: get Pod and verify state
+	pod, err := o.KubeCli.CoreV1().Pods(o.Namespace).Get(context.Background(), o.PodName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	if pod.Status.Phase == v1.PodSucceeded || pod.Status.Phase == v1.PodFailed {
+		return fmt.Errorf("cannot debug in a completed pod; current phase is %s", pod.Status.Phase)
+	}
+
+	containerName := o.ContainerName
+	if len(containerName) == 0 {
+		containerName = pod.Spec.Containers[0].Name
+	}
+
+	nodeName := pod.Spec.NodeName
+	targetContainerID, err := o.getContainerIDByName(pod, containerName)
+	if err != nil {
+		return err
+	}
+
+	launcher := o.makeLauncherPod(nodeName, targetContainerID, o.Command)
+	pod, err = o.KubeCli.CoreV1().Pods(launcher.Namespace).Create(context.Background(), launcher, metav1.CreateOptions{})
+
+	if err != nil {
+		klog.Info("Ceate Debug Pod Failed!")
+		return err
+	}
+
+	return nil
+}
+
+func (o *PodExecOptions) makeLauncherPod(nodeName, containerID string, command []string) *v1.Pod {
+	volume, mount := MakeDockerSocketMount(o.HostDockerSocket, true)
+	// we always mount docker socket to default path despite the host docker socket path
+	launchArgs := []string{
+		"--target-container",
+		containerID,
+		"--image",
+		"--privileged",
+		"false",
+		o.Image,
+		"--docker-socket",
+		fmt.Sprintf("unix://%s", DockerSocket),
+	}
+
+	launchArgs = append(launchArgs, "--")
+	launchArgs = append(launchArgs, command...)
+	return &v1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-%s-%s-%s", o.Namespace, o.PodName, o.ContainerName, launcherName),
+			Namespace: o.Namespace,
+		},
+		Spec: v1.PodSpec{
+			Containers: []v1.Container{
+				{
+					Name:            launcherName,
+					Image:           o.LauncherImage,
+					Args:            launchArgs,
+					Stdin:           true,
+					TTY:             true,
+					VolumeMounts:    []v1.VolumeMount{mount},
+					ImagePullPolicy: v1.PullAlways,
+				},
+			},
+			Volumes:       []v1.Volume{volume},
+			NodeName:      nodeName,
+			RestartPolicy: v1.RestartPolicyNever,
+		},
+	}
+}
+
+func (o *PodExecOptions) getContainerIDByName(pod *v1.Pod, containerName string) (string, error) {
+	for _, containerStatus := range pod.Status.ContainerStatuses {
+		if containerStatus.Name != containerName {
+			continue
+		}
+		if !containerStatus.Ready {
+			return "", fmt.Errorf("container [%s] not ready", containerName)
+		}
+		return containerStatus.ContainerID, nil
+	}
+
+	// also search init containers
+	for _, initContainerStatus := range pod.Status.InitContainerStatuses {
+		if initContainerStatus.Name != containerName {
+			continue
+		}
+		if initContainerStatus.State.Running == nil {
+			return "", fmt.Errorf("init container [%s] is not running", containerName)
+		}
+		return initContainerStatus.ContainerID, nil
+	}
+
+	return "", fmt.Errorf("cannot find specified container %s", containerName)
+}
+
+func MakeDockerSocketMount(hostDockerSocket string, readOnly bool) (volume v1.Volume, mount v1.VolumeMount) {
+	mount = v1.VolumeMount{
+		Name:      "docker",
+		ReadOnly:  readOnly,
+		MountPath: DockerSocket,
+	}
+	volume = v1.Volume{
+		Name: "docker",
+		VolumeSource: v1.VolumeSource{
+			HostPath: &v1.HostPathVolumeSource{
+				Path: hostDockerSocket,
+			},
+		},
+	}
+	return
 }
