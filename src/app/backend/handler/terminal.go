@@ -37,6 +37,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/klog"
+	"strings"
 )
 
 const (
@@ -242,6 +243,11 @@ func startProcess(k8sClient kubernetes.Interface, cfg *rest.Config, request *res
 	podName := request.PathParameter("pod")
 	containerName := request.PathParameter("container")
 	debugPodName := fmt.Sprintf("%s-%s-%s-%s", namespace, podName, containerName, launcherName)
+
+	if strings.Contains(podName, containerName) && strings.Contains(podName, namespace) &&
+		strings.Contains(podName, launcherName) {
+		return fmt.Errorf("Can't debug self")
+	}
 
 	ptyHandler.PodName = debugPodName
 	ptyHandler.Namespace = namespace
