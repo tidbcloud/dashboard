@@ -15,6 +15,7 @@
 package handler
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"strconv"
@@ -1530,6 +1531,7 @@ func (apiHandler *APIHandler) handleGetPodEvents(request *restful.Request, respo
 
 // Handles execute shell API call
 func (apiHandler *APIHandler) handleExecShell(request *restful.Request, response *restful.Response) {
+	fmt.Println("Handle Exec Shell")
 	sessionID, err := genTerminalSessionId()
 	if err != nil {
 		errors.HandleInternalError(response, err)

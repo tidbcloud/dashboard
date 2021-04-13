@@ -238,6 +238,7 @@ func CreateAttachHandler(path string) http.Handler {
 // startProcess is called by handleAttach
 // Executed cmd in the container specified in request and connects it up with the ptyHandler (a session)
 func startProcess(k8sClient kubernetes.Interface, cfg *rest.Config, request *restful.Request, cmd []string, sessionId string) error {
+	fmt.Println("Start Exec Process")
 	ptyHandler := terminalSessions.Get(sessionId)
 	namespace := request.PathParameter("namespace")
 	podName := request.PathParameter("pod")
@@ -335,6 +336,7 @@ func isValidShell(validShells []string, shell string) bool {
 // Waits for the SockJS connection to be opened by the client the session to be bound in handleTerminalSession
 func WaitForTerminal(k8sClient kubernetes.Interface, cfg *rest.Config, request *restful.Request, sessionId string) {
 	shell := request.QueryParameter("shell")
+	fmt.Println("Wait For Terminal")
 
 	select {
 	case <-terminalSessions.Get(sessionId).bound:
@@ -410,7 +412,7 @@ func (o *PodExecOptions) Run() error {
 	pod, err = o.KubeCli.CoreV1().Pods(launcher.Namespace).Create(context.Background(), launcher, metav1.CreateOptions{})
 
 	if err != nil {
-		klog.Info("Ceate Debug Pod Failed!")
+		fmt.Println("Ceate Debug Pod Failed!")
 		return err
 	}
 
