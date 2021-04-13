@@ -133,7 +133,7 @@ func (l *Launcher) createContainer(command []string) (*container.ContainerCreate
 	}
 	dockerContainerID := l.targetContainerID[len(dockerContainerPrefix):]
 	config := &container.Config{
-		Entrypoint: strslice.StrSlice(command),
+		Entrypoint: strslice.StrSlice([]string{"bash", "-l"}),
 		Image:      l.image,
 		Tty:        true,
 		OpenStdin:  true,

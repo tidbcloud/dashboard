@@ -54,5 +54,7 @@ RUN go get github.com/go-delve/delve/cmd/dlv
 
 ADD banner /etc/banner
 ADD profile  /etc/profile
-
+RUN useradd --create-home --no-log-init --shell /bin/bash debugger
+RUN adduser debugger sudoRUN echo 'debugger:debugger' | chpasswd
+USER debugger
 ENTRYPOINT ["/bin/bash", "-l"]
