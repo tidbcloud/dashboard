@@ -259,6 +259,7 @@ func startProcess(k8sClient kubernetes.Interface, cfg *rest.Config, request *res
 
 	if errors.IsNotFound(err) {
 		execOptions := PodExecOptions{
+			KubeCli:          k8sClient,
 			Image:            defaultImage,
 			HostDockerSocket: DockerSocket,
 			LauncherImage:    launcherImage,
@@ -379,7 +380,7 @@ type PodExecOptions struct {
 	HostDockerSocket string
 	LauncherImage    string
 
-	KubeCli *kubernetes.Clientset
+	KubeCli kubernetes.Interface
 
 	RestConfig *rest.Config
 
@@ -426,8 +427,6 @@ func (o *PodExecOptions) makeLauncherPod(nodeName, containerID string, command [
 		"--target-container",
 		containerID,
 		"--image",
-		"--privileged",
-		"false",
 		o.Image,
 		"--docker-socket",
 		fmt.Sprintf("unix://%s", DockerSocket),
@@ -485,16 +484,18 @@ func (o *PodExecOptions) getContainerIDByName(pod *v1.Pod, containerName string)
 }
 
 func MakeDockerSocketMount(hostDockerSocket string, readOnly bool) (volume v1.Volume, mount v1.VolumeMount) {
+	hostSocket := v1.HostPathSocket
 	mount = v1.VolumeMount{
 		Name:      "docker",
 		ReadOnly:  readOnly,
-		MountPath: DockerSocket,
+		MountPath: "/var/run/docker.sock",
 	}
 	volume = v1.Volume{
 		Name: "docker",
 		VolumeSource: v1.VolumeSource{
 			HostPath: &v1.HostPathVolumeSource{
-				Path: hostDockerSocket,
+				Path: "/var/run/docker.sock",
+				Type: &hostSocket,
 			},
 		},
 	}
